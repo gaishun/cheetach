@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package mds;
+
+service MetadataServer {
+	rpc AssignDss (AssignDssRequest) returns (AssignDssReponse) {}
+	rpc GetSpace(SpaceRequest) returns (stream SpaceResponse) {}
+	rpc SaveMetadata(MetadataRequest) returns (MetadataResponse) {}
+	rpc GetResponse(ResponseRequest) returns (MetadataResponse) {}
+	rpc RemoveMetadata(SpaceRequest) returns (MetadataResponse) {}
+	rpc GetMetadata(SpaceRequest) returns (MetadataRequest) {}
+}
+
+message AssignDssRequest {
+	sint32 count = 1;
+	repeated uint64 duan = 2;
+}
+message AssignDssReponse {
+	sint32 ret = 1;
+}
+
+
+message SpaceRequest {
+	string name = 1;
+	uint64 size = 2;
+}
+
+message Extent {
+	uint64 offset = 1;
+	uint64 length = 2;
+}
+
+message SpaceResponse {
+	sint32 ret = 1;
+	uint32 ds = 2;
+	uint64 count = 3;
+	repeated Extent Extents = 4;
+}
+
+message MetadataRequest {
+	string name = 1;
+	uint64 size = 2;
+	uint32 ds = 3;
+	uint64 count = 4;
+	repeated Extent Extents = 5;
+}
+
+message MetadataResponse {
+	sint32 ret = 1;
+}
+
+message ResponseRequest {
+	sint32 ret = 1;
+}

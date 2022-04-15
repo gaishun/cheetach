@@ -1,0 +1,221 @@
+package bitstore
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"syscall"
+)
+
+type pdata struct {
+	length 	uint64
+	offset 	uint64
+	data	[]byte
+}
+
+var (
+	TempPort = "127.0.0.1:8081"
+	Logdir = "./log"
+	diskErrChan = make(chan error)
+ 	retErrChan = make(chan error)
+)
+
+type BitStoreService struct {
+	Block_device *Block_device_t
+}
+
+
+
+func (s *BitStoreService) Put(put BitStore_PutServer) error {
+	log.Println("revoke PUT operations")
+	//var n int
+	var err error
+	var req *PutRequest
+	var resp = new(PutResponse)
+	var quit = make(chan error)
+	for ;true;  {
+		//question : 怎么确定读取结束。
+		req, err = put.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil  || req == nil{
+			log.Printf("PUT Object req is nil ， %v\n",req)
+			break
+		}
+
+		log.Printf("PUT ,\t%v\t,%v\t,%v\t",req.Offset,req.Length,req.Data[0:3])
+
+		err = nil
+		//goroutie里面执行
+		go func(fd int, data []byte , offset int64,err error) {
+			//两次函数会改变data切片的地址，当然对put方法没什么区别。
+			_, err = syscall.Pwrite(fd, data , offset)
+			quit <- err
+		}(s.Block_device.Fd_direct, req.Data , int64(req.Offset),err)
+	}
+	for i:=0 ; i < len(quit) ;i++ {
+		err = <- quit
+		if  err != nil {
+			log.Printf("fail to PWrite , %v\n",err)
+		}
+	}
+
+
+	err = DFsync(s.Block_device.Fd_direct)
+	if err != nil {
+		log.Println("fail to sync")
+		//同步失败
+		return err
+	}
+
+	resp.Errcode = 0
+	err = put.SendAndClose(resp)
+	if err != nil {
+		log.Println(fmt.Sprintf("fail to sendandclose,%v",err))
+	}
+	return nil
+}
+
+
+func (s *BitStoreService) Get(get BitStore_GetServer) error {
+	//log.Println("revoke GET operations")
+	var err error
+	var req *GetRequest
+	var resp = new(GetResponse2)
+	var count = 0
+	var rdata []byte
+	//var rdata []pdata
+	//初始化一个容量，避免后期内存复制。
+	//rdata =  make([]pdata,1000,1000)
+	//先把数据都存下来
+	for ;true;count++ {
+		//question : 怎么确定读取结束。
+		req, err = get.Recv();
+		if err == io.EOF {
+			//ilog.Println("Recv() normal END")
+			// log.Println(err)
+			//         return nil
+			break
+		}
+		if err != nil {
+			log.Println("GET ERROR %v",err)
+			//read err  暂时作为结束标志
+			//	return nil
+			break
+		}
+		log.Println("GET")
+		log.Println(req.Length)
+		log.Println(req.Offset)
+		rdata = make([]byte, req.Length, req.Length)
+		//两次函数会改变data切片的地址
+		_, err := syscall.Pread(s.Block_device.Fd_direct, rdata, int64(req.Offset))
+		//_ ,err = DRead(s.Block_device ,int64(req.Offset) , rdata[i].data )
+		if err != nil {
+			log.Fatal("磁盘读取信息失败")
+			log.Println(err)
+			return err
+		}
+		//返回数据
+		var buffer bytes.Buffer
+		buffer.Write(rdata)
+		resp.Data = make([]byte, len(rdata), len(rdata))
+		_ ,err = buffer.Read(resp.Data)
+		if err != nil {
+			log.Fatal("copy数据失败")
+			log.Println(err)
+			return err
+		}
+		resp.Errcode = 0
+		err = get.Send(resp)
+		if err != nil {
+			log.Fatal("发送数据失败")
+			log.Println(err)
+			return err
+		}
+	}
+
+
+	return nil
+}
+//
+//
+//func PRead_thread (fd int, data []byte , offset int64 , respp *GetResponse2 , gett *BitStore_GetServer, err error){
+//	_, err = syscall.Pread(fd, data, offset)
+//
+//	diskErrChan <- err
+//
+//	var buffer bytes.Buffer
+//	buffer.Write(data)
+//	respp.Data = make([]byte, len(data), len(data))
+//
+//	_ ,_ = buffer.Read(respp.Data)
+//	log.Printf("respp.Data = , %v\n",respp.Data[0:3])
+//
+//	respp.Errcode = 0
+//
+//	err = (*gett).Send(respp)
+//	retErrChan <- err
+//
+//}
+//
+//
+////Get 方法
+//func (s *BitStoreService) Get(get BitStore_GetServer) error {
+//	//log.Println("revoke GET operations")
+//	var err error
+//	var req *GetRequest
+//	var resp = new(GetResponse2)
+//	var rdata []byte
+//
+//	//var rdata []pdata
+//	//初始化一个容量，避免后期内存复制。
+//	//rdata =  make([]pdata,1000,1000)
+//
+//	//先把数据都存下来
+//	for ;true; {
+//		//question : 怎么确定读取结束。
+//		req, err = get.Recv()
+//		if err == io.EOF {
+//			break
+//		}
+//		if err != nil {
+//			log.Println("GET ERROR %v",err)
+//			break
+//		}
+//		log.Println("GET")
+//		log.Println(req.Length)
+//		log.Println(req.Offset)
+//		rdata = make([]byte, req.Length, req.Length)
+//
+//		err = nil
+//		//两次函数会改变data切片的地址
+//		//go  read_thread(s.Block_device.Fd_direct , rdata ,  int64(req.Offset), resp , get)
+//		go PRead_thread(s.Block_device.Fd_direct , rdata , int64(req.Offset) , resp , &get ,err )
+//	}
+//
+//	for i:=0 ; i < len(diskErrChan) ;i++{
+//		err = <- diskErrChan
+//		if err!=nil {
+//			log.Fatalln(fmt.Sprintf("磁盘读取信息失败 %v", err))
+//			return err
+//		}
+//		err = <- retErrChan
+//		if err!=nil {
+//			log.Fatalln(fmt.Sprintf("copy数据失败 , %v", err))
+//			return err
+//		}
+//	}
+//	log.Println("SUCCESS")
+//
+//
+//	//写入返回信息,直接发送
+//	return nil
+//}
+
+
+
+
+
+

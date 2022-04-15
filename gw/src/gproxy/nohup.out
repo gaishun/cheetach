@@ -1,0 +1,19 @@
+startAllDescription -port=8080
+startAllDescription -port=8080
+I0501 09:29:13  2424 router.go:63] startAllDescription module
+2021/05/01 09:29:13 config.go:260: aaaaaaaa: 192.168.9.116:4306
+2021/05/01 09:29:18 pool.go:214: close pool success: address:192.168.9.116:4306, index:0, current:0, ref:0. option:{0x99af60 64 64 128 true}
+F0501 09:29:18  2424 router.go:103] failed to init mds grpc pool: dial is not able to fill the pool: context deadline exceeded
+goroutine 1 [running]:
+lib/glog.stacks(0xc0001a3e00, 0xc0000440e0, 0x7f, 0xda)
+	/gks/GOPATH/src/lib/glog/glog.go:767 +0xb8
+lib/glog.(*loggingT).output(0x10d98a0, 0xc000000003, 0xc000204af0, 0x1067df2, 0x9, 0x67, 0x0)
+	/gks/GOPATH/src/lib/glog/glog.go:718 +0x351
+lib/glog.(*loggingT).printf(0x10d98a0, 0x3, 0xb7942d, 0x20, 0xc00020de08, 0x1, 0x1)
+	/gks/GOPATH/src/lib/glog/glog.go:656 +0x14b
+lib/glog.Fatalf(...)
+	/gks/GOPATH/src/lib/glog/glog.go:1149
+_/gks/gw/src/module.runAll(0x10cbda0, 0xc00011c170, 0x0, 0x0, 0x0)
+	/gks/gw/src/module/router.go:103 +0x3af
+main.main()
+	/gks/gw/src/gproxy/gproxy.go:210 +0x330

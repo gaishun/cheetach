@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/context" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/lib/mux" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/lib/pool" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/context" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/github.com/golang.bak/protobuf.bak" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/github.com/golang/protobuf" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/github.com/golang/sys" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/github.com/googleapis/go-genproto" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/crypto" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/image" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/lint" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/net" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/sync" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/sys" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/text" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/golang.org/x/tools" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/google.golang.org/genproto" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/google.golang.org/grpc" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/google.golang.org/grpc,bak" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/lib/mux" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/src/lib/pool" vcs="Git" />
+  </component>
+</project>

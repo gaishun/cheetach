@@ -1,0 +1,155 @@
+package service
+
+import (
+	"bytes"
+	"config"
+	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	bitstore "service/dsspb"
+	mds "service/mdspb"
+	"time"
+)
+
+func GetFileLogicGrpc(ctx *Context) {
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString("ng-start-read: ")
+	buf.WriteString(fmt.Sprintf("req in time: %v --->", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds()))
+	// meta data
+	resp := getMetadata(ctx)
+	if resp == nil {
+		return
+	}
+	if resp.Count == 0 || len(resp.Extents) == 0 {
+		ctx.result = &Result{InternalError, "mds return no space"}
+		return
+	}
+	buf.WriteString(fmt.Sprintf("get allocater time: %v --->", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds()))
+
+	// addrs := config.GetDiskServer(SelectDisk(ctx.ns, ctx.key))
+	addrs := config.GetDiskServer(int(resp.Ds))
+	//addrs := []string{"10.90.27.13:8071"}
+	fmt.Println(addrs)
+
+	// conn, err := grpc.Dial(addrs[rand.Intn(len(addrs))], DialOpt...)
+	conn, err := config.DSSPool[addrs[rand.Intn(len(addrs))]].Get()
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("can't connect: %v", err)}
+		return
+	}
+	defer conn.Close()
+
+	client := bitstore.NewBitStoreClient(conn.Value())
+	stream, err := client.Get(context.Background())
+        fmt.Printf("print stream111111111:'%%#v' %#v\n", stream)
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("put stream error: %v", err)}
+		return
+	}
+	buf.WriteString(fmt.Sprintf("dss grpc craete time: %v --->", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds()))
+
+	req := &bitstore.GetRequest{
+		Offset: ctx.offset,
+		Length: ctx.length,
+	}
+	fmt.Println("get offset: ", req.Offset)
+	fmt.Println("get length: ", req.Length)
+
+	if err := stream.Send(req); err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("send get req error: %v", err)}
+		return
+	}
+	if err := stream.CloseSend(); err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("close send error: %v", err)}
+		return
+	}
+	buf.WriteString(fmt.Sprintf("req send time: %v --->", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds()))
+
+	resp2, err := stream.Recv()
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get resp error: %v", err)}
+		return
+	}
+
+	if resp2.Errcode < 0 {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get resp error code error: %v", resp2.Errcode)}
+		return
+	}
+        fmt.Printf("print stream2222222222:'%%#v' %#v\n", stream)
+       
+	s :=make([]uint8,524288)
+	for index := 0; index < 524288; index++ {
+        s[index] = resp2.Data[index]
+    }
+       fmt.Printf("get object size:", len(s))
+
+        ctx.reader= bytes.NewReader(s)
+        
+//	fmt.Println("get object size: ", len(resp2.Data))
+//	ctx.reader = bytes.NewReader(resp2.Data)
+	buf.WriteString(fmt.Sprintf("recv data time: %v --->", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds()))
+}
+
+func getMetadata(ctx *Context) *mds.MetadataRequest {
+	mdsAddr := SelectMds(ctx.ns, ctx.key)
+	if mdsAddr == "" {
+		ctx.result = &Result{InternalError, fmt.Sprintf("no mds to use")}
+		return nil
+	}
+	// conn, err := grpc.Dial(mdsAddr, DialOpt...)
+	conn, err := config.MDSPool[mdsAddr].Get()
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("can't connect: %v", err)}
+		return nil
+	}
+	defer conn.Close()
+
+	client := mds.NewMetadataServerClient(conn.Value())
+	req := mds.SpaceRequest{
+		Name: ctx.ns + ctx.key,
+		Size: uint64(ctx.size),
+	}
+
+	resp, err := client.GetMetadata(context.Background(), &req)
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get space error: %v", err)}
+		return nil
+	}
+
+	if resp.Count == 0 {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get space to error: no space")}
+		return nil
+	}
+	fmt.Println(resp)
+	ctx.offset = resp.Extents[0].Offset
+	ctx.length = resp.Extents[0].Length
+	return resp
+}
+
+func SuccRespGetFileGrpc(w http.ResponseWriter, ctx *Context) {
+	var err error
+
+	w.Header().Set("x-request-id", ctx.requestId)
+	w.Header().Set("x-gift-server", ctx.host)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", ctx.length))
+
+	w.WriteHeader(ctx.result.ErrorCode.StatusCode)
+
+	ctx.size, err = io.Copy(w, ctx.reader)
+	if err != nil {
+		ctx.result = &Result{IOCopyFailure, "io.Copy fail: " + err.Error()}
+		return
+	}
+}
+
+func SuccRespHeadFileGrpc(w http.ResponseWriter, ctx *Context) {
+	w.Header().Set("x-request-id", ctx.requestId)
+	w.Header().Set("x-gift-server", ctx.host)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	w.WriteHeader(ctx.result.ErrorCode.StatusCode)
+	w.Write(nil)
+}

@@ -1,0 +1,141 @@
+package bitstore
+
+import (
+	"bytes"
+	"io"
+	"log"
+	"syscall"
+)
+
+type pdata struct {
+	length 	uint64
+	offset 	uint64
+	data	[]byte
+}
+
+var (
+	TempPort = "127.0.0.1:8081"
+	Logdir = "./log"
+)
+
+type BitStoreService struct {
+	UnimplementedBitStoreServer
+	Block_device *Block_device_t
+}
+
+func (s *BitStoreService) Put(put BitStore_PutServer) error {
+	log.Println("revoke PUT operations")
+	//var n int
+	var err error
+	var req *PutRequest
+	//var wdata []pdata
+	//初始化一个容量，避免后期内存复制。
+	//wdata = make([]pdata,1000,1000)
+
+	for i:=0 ;true; i++ {
+		//question : 怎么确定读取结束。
+		req, err = put.Recv()
+		if err == io.EOF {
+			log.Println("Recv() normal END")
+			break
+		}
+		if err != nil {
+			log.Println("Recv() error END")
+			break
+		}
+
+
+		//wdata[i] = pdata{
+		//	length: req.Length,
+		//	offset: req.Offset,
+		//	data: make([]byte, req.Length,req.Length),
+		//}
+
+		//两次函数会改变data切片的地址，当然对put方法没什么区别。
+		_,err = syscall.Pwrite(s.Block_device.Fd_direct , req.Data , int64(req.Offset))
+		//n ,err = DWrite(s.Block_device , int64(req.Offset), req.Data)
+		log.Println("offset ======== %v",req.Offset)
+
+		if err != nil {
+			//落盘err
+			return err
+		}
+	}
+
+	err = DFsync(s.Block_device.Fd_direct)
+	if err != nil {
+		//同步失败
+		return err
+	}
+	//应当返回grpc-success
+	return nil
+}
+
+func (s *BitStoreService) Get(get BitStore_GetServer) error {
+	log.Println("revoke GET operations")
+	var err error
+	var req *GetRequest
+	var resp =new(GetResponse2)
+	//var ret int
+	var count = 0
+	var rdata []pdata
+	//初始化一个容量，避免后期内存复制。
+	rdata =  make([]pdata,1000,1000)
+
+	//先把数据都存下来
+	for ;true;count++ {
+		//question : 怎么确定读取结束。
+		req, err = get.Recv();
+		if err != nil {
+			//read err  暂时作为结束标志
+			break
+		}
+		rdata[count] = pdata{
+			length: req.Length,
+			offset: req.Offset,
+			data: make([]byte , req.Length,req.Length),
+		}
+	}
+
+	//再一起落盘读
+	for i:=0 ; i< count ;i++ {
+		
+		//两次函数会改变data切片的地址，当然对put方法没什么区别。
+		_,err := syscall.Pread( s.Block_device.Fd_direct , rdata[i].data , int64(rdata[i].offset))
+		//_ ,err = DRead(s.Block_device ,int64(req.Offset) , rdata[i].data )
+		if err != nil {
+			log.Fatal("磁盘读取信息失败")
+			return err
+		}
+	}
+	//同步磁盘信息。（这的要写这个函数吗？）
+	err = DFsync(s.Block_device.Fd_direct)
+	if err != nil {
+		log.Fatal("落盘同步失败")
+		return err
+	}
+
+	//写入返回信息
+	var buffer bytes.Buffer
+	for i:=0 ; i<count ; i++ {
+		buffer.Write(rdata[i].data)
+	}
+	//将数据写入返回数据中
+	_ , err = buffer.Read(resp.Data)
+	if err != nil {
+		log.Println("buffer 传值错误")
+		return err
+	}
+	resp.Errcode = 0
+	err = get.Send(resp)
+	if err != nil {
+		log.Fatal("发送数据失败")
+		return err
+	}
+	return nil
+}
+
+
+
+
+

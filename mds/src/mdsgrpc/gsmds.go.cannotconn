@@ -1,0 +1,542 @@
+//package mdsserver
+package main
+import (
+	//mds "../mdspb"
+	"../opera"
+	"fmt"
+	"log"
+	"net"
+	mds "../mdspb" // 引入编译生成的包
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/grpclog"
+	"github.com/tecbot/gorocksdb"
+	//   "io/ioutil"
+	"strconv"
+	biu "../biu"
+	"math/rand"
+	"sync"
+	"time"
+	//"strings"
+	"unsafe"
+)
+
+const (
+	// Address gRPC服务地址
+	Address = "192.168.9.116:4306"
+)
+const (
+	DB_PATH = "/home/zym/Desktop/lrm/example/db"
+	DISK_SIZE = 2199023255552
+	ALLOCATE_UNIT = 8 * 1024//1kb？还是8kb？   是1024个8bit 还是 8个1024B？  应该是8kB
+	PREFIX_METADATA = "BLOBMD"
+)
+var db *gorocksdb.DB
+
+type fileMetadata struct {
+	name    string
+	size    uint64
+	disk      uint32
+	extents []*mds.Extent
+}
+var OFFSET  uint64  //disk_count=4
+var hLock sync.Mutex //全局同步锁
+var disk_COUNT int
+var max_load []uint64	//通过gw传过来的信息初始化 记录有多少个段
+//var freeListManager [4][2097162] []byte  // 2097152个段，一个段包含128个block//一个block多大？
+var freeListManager [][][]byte	//通过disk_COUNT确定有多少个主dss与该mds对应。然后通过max_load确定最多有多少段。
+								// （每段128块，每块8kb）
+var workload []uint64
+var loadmux sync.Mutex
+//初始化位图和disk负载信息
+func init_fm () {
+	i:=0
+	j:=0
+	workload = make([]uint64 ,disk_COUNT , disk_COUNT)
+	freeListManager = make([][][]byte , disk_COUNT , disk_COUNT)
+	//var key string
+	for i= 0; i<disk_COUNT ;i++ {
+		workload[i]=uint64(0)
+		freeListManager[i] = make([][]byte , 2097162,2097162)
+		for j=0;j< DISK_SIZE/(ALLOCATE_UNIT*128);j++{ //段数量，一个段包含128个block
+			freeListManager[i][j] = []byte{0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0, 0, 0, 0, 0, 0}// 16个字节对应128个bit，代表128个block状态
+		}
+	}
+}
+
+func workload_add(add uint64,idx int)  {
+	loadmux.Lock()
+	log.Println("锁住，增加负载")
+	log.Printf("disk status show :%v \nindex is %v \n add %v", workload,idx ,add )
+	workload[idx] += add
+	loadmux.Unlock()
+	log.Println("解锁增加负载")
+}
+func workload_sub(sub uint64,idx int)  {
+	loadmux.Lock()
+	if(workload[idx] < sub){
+		loadmux.Unlock()
+		return 
+	}
+	log.Println("锁住，减小负载")
+	log.Printf("disk status show :%v \nindex is %v \n sub %v", workload,idx ,sub )
+	workload[idx] -= sub
+	loadmux.Unlock()
+	log.Println("解锁减小负载")
+}
+
+func find_curduan(b_s []byte, be int, len int)  int{//查找这个b_s这个块从be开始，连续len长度的空间是不是都是0
+	var bjw_find int = 0
+	for j,_ := range b_s {
+		if j ==be{
+			for z :=0; z <len ;z++{ //查找连续block为空闲
+				if b_s[j+z] != byte('0'){
+					bjw_find = 0
+					j = j+z
+					break
+				}else{
+					bjw_find = 1
+				}
+			}
+		}
+	}
+	return bjw_find
+}
+func get_offset (m int, block_num int) (uint64,int,int ){
+	var bjw_find int = 0
+	var offset uint64 =0
+	var duan_num int =0
+	var double_duan int =0
+	for i:= 0;i<DISK_SIZE/(ALLOCATE_UNIT*128);i++{  //在段中查找 //一个段最多存储，128 * 8 * 1024字节？
+		s := biu.BytesToBinaryString(freeListManager[m][i])  //一个128位的str，记录了第m个磁盘，第i个段的128个block的状态
+		b_s := str2bytes(s)
+		//fmt.Println(b_s)
+		for j:=0; j<128;j++ {   //在128个bit中查找空闲block
+			if b_s[j] == byte('0'){
+				if j+block_num >= 128 {   //涉及两个段
+					var  bjw_curduan int =0
+					bjw_curduan = find_curduan(b_s,j,128-j)
+					if bjw_curduan == 1{
+						// fmt.Println("s = ",b_s)
+						// fmt.Println("j = ",j)
+						s2 := biu.BytesToBinaryString(freeListManager[m][i+1])
+						b_s2 := str2bytes(s2)
+						// fmt.Println("s2 = ",b_s2)
+						bjw_find = find_curduan(b_s2,0,block_num-(128-j))
+					}
+				}else {                    //涉及一个段
+					bjw_find =find_curduan(b_s, j, block_num)
+				}
+			}
+			if bjw_find == 1 {  //更新freelistmanager
+				if j+ block_num >=128{
+					double_duan = 1
+					update_freelistmanager(m, i, j, (128-j))
+					update_freelistmanager(m, i+1, 0, block_num-(128-j))
+				}else {
+					update_freelistmanager(m, i, j, block_num)
+				}
+				duan_num = i
+				offset = uint64(((i*128)+j)*int(ALLOCATE_UNIT) + int(OFFSET))//（段号*128+段中块号）*（块大小）+524288，为什么要加524288？
+				break
+			}
+		}
+		if bjw_find == 1{
+			break
+		}
+	}
+	return offset,duan_num,double_duan
+}
+func update_freelistmanager(disk_num int, duan_num int, be int, len int){
+	s := biu.BytesToBinaryString(freeListManager[disk_num][duan_num])
+	b_s := str2bytes(s)  //128位
+	for i:= 0; i< len ;i++{
+		if b_s[be+i] == byte('0'){
+			b_s[be+i] = byte('1')
+		}else {
+			b_s[be+i] = byte('0')
+		}
+	}
+	s_b := bytes2str(b_s)
+	bs2 := biu.BinaryStringToBytes(s_b)
+	freeListManager[disk_num][duan_num] = bs2
+}
+func update_freelistDB(disk_num int, duan_num int , double_duan int ){
+	wo := gorocksdb.NewDefaultWriteOptions()
+	var key string
+	str_disk :=strconv.Itoa(disk_num)
+	str_duan :=strconv.Itoa(duan_num)
+	key = "bb" + value_encode(str_disk) + value_encode(str_duan)
+	_ = db.Delete(wo, []byte(key))
+	_ = db.Put(wo, []byte(key), []byte(freeListManager[disk_num][duan_num]))
+	if double_duan == 1 {
+		str_duan =strconv.Itoa(duan_num+1)
+		key = "bb" + value_encode(str_disk) + value_encode(str_duan)
+		_ = db.Delete(wo, []byte(key))
+		_ = db.Put(wo, []byte(key), []byte(freeListManager[disk_num][duan_num+1]))
+	}
+}
+
+func select_dss() uint32 {
+	var minn uint64
+	log.Println("select dss~~~\n")
+	minn =  99999999999999
+	var ret uint32
+	ret = 0
+	loadmux.Lock()
+	for i := 0; i < disk_COUNT; i++ {
+		if minn>workload[i] {
+			ret = uint32(i)
+			minn = workload[i]
+		}
+	}
+	loadmux.Unlock()
+	log.Printf("disk status show :%v \n choose dss %v", workload ,ret )
+	return ret
+}
+func allocate_space(meta *fileMetadata) int32{
+	//meta.disk = uint32(rand.Intn(100)% disk_COUNT)//随机确定一个进程   //要改成选一个复杂最小的
+	meta.disk = select_dss()
+	m := int(meta.disk)
+	block_num := int(meta.size) / int(ALLOCATE_UNIT)//已经进行了8k对齐
+	var duan_num int
+	var double_duan int = 0
+	var extent mds.Extent
+	hLock.Lock()
+	extent.Offset , duan_num, double_duan = get_offset(m, block_num)//extent.offset
+	hLock.Unlock()
+
+	//更新数据库中freelist的内容
+	update_freelistDB(m, duan_num, double_duan)
+
+
+	extent.Length = meta.size//extent.length
+	meta.extents = append(meta.extents, &extent)
+	//fmt.Println( "meta offset =", extent.Offset)
+	//fmt.Println( "meta disk =", meta.disk)
+	return 0
+}
+func save_metadata(meta *fileMetadata) int32{//根据meta信息
+	key := PREFIX_METADATA
+	key = key + "0"
+	key = key + meta.name
+
+	var value string
+	//size 16 disk 16 offset 16 length 16 放进去value
+	{
+		str_size := strconv.Itoa(int(meta.size))
+		str_disk := strconv.Itoa(int(meta.disk))
+		str_offset :=  strconv.Itoa(int(meta.extents[0].Offset))
+		str_length := strconv.Itoa(int(meta.extents[0].Length))
+		value = value_encode(str_size) + value_encode(str_disk) +  value_encode(str_offset)+ value_encode(str_length)
+	}
+
+	wo := gorocksdb.NewDefaultWriteOptions()
+	_ = db.Put(wo, []byte(key), []byte(value))
+
+	return 0
+}
+func get_metadata(meta *fileMetadata) int32{//根据meta.name从rocksdb中读取数据，然后按字节拆开，得到object信息，赋值给meta
+	key := PREFIX_METADATA
+	key = key + "0"
+	key = key + meta.name
+
+	ro := gorocksdb.NewDefaultReadOptions()
+	value, _ := db.Get(ro, []byte(key))
+	defer value.Free()
+	str_value := value.Data()[:]
+	//fmt.Println("get metadata value: ", string(value.Data()[:]))
+	if len(str_value) > 0{
+		b_str := str2bytes(string(str_value))
+
+		b_size := b_str[0:16]
+		b_disk := b_str[16:32]
+		b_offset := b_str[32:48]
+		b_length := b_str[48:64]
+
+		str_size := bytes2str(b_size)
+		str_disk := bytes2str(b_disk)
+		str_offset := bytes2str(b_offset)
+		str_length := bytes2str(b_length)
+
+		size,_ := strconv.Atoi(str_size)
+		disk,_ := strconv.Atoi(str_disk)
+		offset,_ := strconv.Atoi(str_offset)
+		length,_ := strconv.Atoi(str_length)
+		meta.size = uint64(size)
+		meta.disk = uint32(disk)
+		var extent mds.Extent
+		extent.Offset = uint64(offset)
+		extent.Length = uint64(length)
+		meta.extents = append(meta.extents, &extent)
+	}else {
+		fmt.Println("get metadata error")
+	}
+
+	return 0
+}
+func remove_metadata(meta *fileMetadata) int32{
+
+	key := PREFIX_METADATA
+	key = key + "0"
+	key = key + meta.name
+
+	ro := gorocksdb.NewDefaultReadOptions()
+	value, _ := db.Get(ro, []byte(key))
+	defer value.Free()
+	str_value := value.Data()[:]
+	//fmt.Println("remove metadta value: ", string(value.Data()[:]))
+	if len(str_value)>0{
+		b_str := str2bytes(string(str_value))
+		b_size := b_str[0:16]
+		b_disk := b_str[16:32]
+		b_offset := b_str[32:48]
+
+		str_size := bytes2str(b_size)
+		str_disk := bytes2str(b_disk)
+		str_offset := bytes2str(b_offset)
+
+		size,_ := strconv.Atoi(str_size)
+		disk,_ := strconv.Atoi(str_disk)
+		offset,_ := strconv.Atoi(str_offset)
+
+		duan_num := (offset - int(OFFSET))/(int(ALLOCATE_UNIT)*128)
+		be := ((offset - int(OFFSET))/(int(ALLOCATE_UNIT))) % 128
+		block_num := size / int(ALLOCATE_UNIT)
+		if be + block_num >=128{
+			update_freelistmanager(disk,duan_num,be,128-be)
+			update_freelistmanager(disk,duan_num+1,0,block_num-(128-be))
+			update_freelistDB(disk,duan_num,1)
+		}else{
+			update_freelistmanager(disk,duan_num,be,block_num)
+			update_freelistDB(disk,duan_num,0)
+		}
+		//workload[disk] -= uint64(size)
+		workload_sub(uint64(size),disk)
+
+	}else{
+		fmt.Println("none value, have removed metadata")
+		return 0
+	}
+	wo := gorocksdb.NewDefaultWriteOptions()
+	_ = db.Delete(wo, []byte(key))
+	return 0
+}
+
+// 定义helloService并实现约定的接口
+type metadataService struct{
+	savedSpaceRequest []*mds.SpaceRequest
+}
+
+func (s *metadataService) GetSpace(spaceRequest *mds.SpaceRequest, stream mds.MetadataServer_GetSpaceServer,) error{
+	var meta fileMetadata
+	meta.name = spaceRequest.Name
+	meta.size = spaceRequest.Size
+	t_size := int(meta.size)
+	if t_size % 8192 != 0{//初始化，8k对齐。
+		meta.size = uint64((t_size / 8192 +1)*8192)
+	}
+	var ret int32
+	ret = allocate_space(&meta)//四个循环确定分配到哪个block，在meta里面修改，然后成功返回0
+	var response mds.SpaceResponse
+	response.Ret = ret
+	if ret != 0 {
+		//fmt.Println( "If ret's count: %d",response.Count)
+		if err := stream.Send(&response); err != nil{
+			return err
+		}
+		return nil
+	}
+	response.Ds = meta.disk
+	response.Count = uint64(len(meta.extents))//count永远等于一
+	for _, extent  := range meta.extents{//循环永远只执行一次。
+		response.Extents = append(response.Extents, extent)
+	}
+	//fmt.Println("Should be first send's count: %d", response.Count)
+	_ = stream.Send(&response)
+	save_metadata(&meta)
+	response.Ret = ret
+
+	err := opera.Write(meta.name,meta.size)
+	if(err != nil ){
+		log.Printf("************写副本错误-》，%v\n",err)
+	}
+	_ = stream.Send(&response)
+	//workload[meta.disk]+=meta.size//维护每个磁盘的负载
+	workload_add(meta.size , int(meta.disk))
+
+	return nil
+}
+
+func (s *metadataService) SaveMetadata(ctx context.Context, MetadataRequest *mds.MetadataRequest) (*mds.MetadataResponse, error){
+	metadataresp := new(mds.MetadataResponse)
+	//空
+	return metadataresp, nil
+}
+
+func (s *metadataService) GetResponse(ctx context.Context, ResponseRequest *mds.ResponseRequest) (*mds.MetadataResponse, error){
+	metadataresp := new(mds.MetadataResponse)
+	metadataresp.Ret = 0;
+	return metadataresp, nil
+}
+
+//这里是gw和mds建立连接后调用，让mds初始化disk的bitmap和rocksdb的。
+func (s *metadataService) AssignDss (ctx context.Context, req *mds.AssignDssRequest) (*mds.AssignDssReponse, error) {
+	assignresp := new(mds.AssignDssReponse)
+	log.Printf("assign dss start, %v \n, %v", req.Duan, req.Count)
+	disk_COUNT = int(req.Count)
+	max_load = make([]uint64 , disk_COUNT , disk_COUNT)
+	for i := 0 ; i< disk_COUNT ;i++ {
+		max_load[i] = req.Duan[i]
+	}
+	log.Println("assign dss end")
+
+	OFFSET =  524288
+
+	rand.Seed(time.Now().Unix())
+	bbto := gorocksdb.NewDefaultBlockBasedTableOptions()
+	bbto.SetBlockCache(gorocksdb.NewLRUCache(3 << 30))
+	opts := gorocksdb.NewDefaultOptions()
+	opts.SetBlockBasedTableFactory(bbto)
+	opts.SetCreateIfMissing(true)
+	db, _ = gorocksdb.OpenDb(opts, DB_PATH)
+	init_fm()
+	log.Println("init finished ")
+
+	var meta fileMetadata
+	meta.name = "test"
+	meta.size = 8192
+	allocate_space(&meta)
+	save_metadata(&meta)
+
+	var getmeta fileMetadata
+	getmeta.name = "test"
+	get_metadata(&getmeta)
+	fmt.Println("getmeta: ", getmeta.name,getmeta.size,getmeta.disk)
+
+	var meta2 fileMetadata
+	meta2.name = "test"
+	remove_metadata(&meta2)
+
+	var meta3 fileMetadata
+	meta3.name = "test"
+	meta3.size = 8192
+	allocate_space(&meta3)
+	save_metadata(&meta3)
+
+	log.Println("SUCCESS Start ROCKDB & bitmap\n")
+
+	err:=opera.Assign(req.Duan,req.Count)
+	if(err != nil ){
+		log.Printf("************副本初始化dss个数错误-》，%v",err)
+	}
+	assignresp.Ret = 0
+	return assignresp, nil
+}
+
+
+func (s *metadataService) RemoveMetadata(ctx context.Context, SpaceRequest *mds.SpaceRequest) (*mds.MetadataResponse, error){
+	metadataresp := new(mds.MetadataResponse)
+	var meta fileMetadata
+	meta.name = SpaceRequest.Name
+	meta.size = SpaceRequest.Size
+	remove_metadata(&meta)
+	metadataresp.Ret = 0
+
+	err:=opera.Delete(meta.name,meta.size)
+	if(err != nil ){
+		log.Printf("************副本删除错误-》，%v\n",err)
+	}
+	return metadataresp, nil
+}
+
+func (s *metadataService) GetMetadata(ctx context.Context, SpaceRequest *mds.SpaceRequest) (*mds.MetadataRequest, error){
+	metadatareq := new(mds.MetadataRequest)
+	var meta fileMetadata
+	meta.name = SpaceRequest.Name
+	get_metadata(&meta)
+	metadatareq.Name = meta.name
+	metadatareq.Size = meta.size
+	metadatareq.Ds = meta.disk
+	metadatareq.Count = uint64(len(meta.extents))
+	for _, extent  := range meta.extents{
+		metadatareq.Extents = append(metadatareq.Extents, extent)
+	}
+	return metadatareq, nil
+}
+
+func str2bytes(s string) []byte {
+	x := (*[2]uintptr)(unsafe.Pointer(&s))
+	h := [3]uintptr{x[0], x[1], x[1]}
+	return *(*[]byte)(unsafe.Pointer(&h))
+}
+
+func bytes2str(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+func value_encode (str string) string{
+	var b [16]byte
+	length := len(str)
+	b_str := str2bytes(str)
+	//fmt.Println("b_str= ",b_str)
+	if length != 16{
+		for i :=0; i< 16-length ;i++ {
+			b[i] = '0'
+		}
+		for j := 16-length; j<16;j++ {
+			b[j] = b_str[j -(16-length)]
+		}
+	}
+	//fmt.Println("b= ",b)
+	var b_str2 string = string(b[:])
+	//fmt.Println("b_str2= ",b_str2)
+	return b_str2
+}
+func key_decode (str string) (int,int) {  //提取disk号和段号，‘bb’ + 16位的disk号 + 16位的段号
+	b_str := str2bytes(str)
+	var b_disk [16]byte
+	var b_duan [16]byte
+
+	for i:= 0;i<16;i++{
+		b_disk[i] = b_str[2+i]
+		b_duan[i] = b_str[18+i]
+	}
+	var b_disk2 string = string(b_disk[:])
+	var b_duan2 string = string(b_duan[:])
+	disk, _ := strconv.Atoi(b_disk2)
+	duan, _ := strconv.Atoi(b_duan2)
+	return disk, duan
+}
+/*
+func free_decode (str string) []byte{  //将形如FFFF FFFFF FFFF FFF0，先转为[16]byte,再转化为128位的二进制
+    b_str := str2bytes(str)
+
+    return
+}
+*/
+
+func main() {
+	listen, err := net.Listen("tcp", Address)
+	if err != nil {
+		grpclog.Fatalf("failed to listen: %v", err)
+	}
+
+	// 实例化grpc Server
+	s := grpc.NewServer()
+
+	// 注册metadataService
+	mds.RegisterMetadataServerServer(s, &metadataService{})
+
+	grpclog.Println("Listen on " + Address)
+
+	opera.Init_pool()
+
+
+
+
+	log.Printf("SUCCESS_START on %v\n",Address)
+
+	s.Serve(listen)
+}
+
+

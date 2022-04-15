@@ -1,0 +1,344 @@
+package service_direct
+
+import (
+	"bytes"
+	"config"
+	"context"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"lib/glog"
+	"lib/pool"
+	"math/rand"
+	"net/http"
+	"time"
+	bitstore "service/dsspb"
+	mds "service/mdspb"
+)
+
+func UploadFileLogicGrpc(ctx *Context) {
+//	log.Println("UploadFileLogicGrpc ACTION")
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString("ng-start: ")
+	UploadCheck(ctx)//把要PUT的内容放到reader
+	if ctx.result.ErrorCode.StatusCode != http.StatusOK {
+		return
+	}
+//	buf.WriteString(fmt.Sprintf("req in time: %v --->", time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println("upload check: ", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds())
+	// meta data
+	resp, mdsConn, mdsAddr := allocMetadata(buf, ctx)//申请内存resp，获取mds链接
+	if mdsConn != nil {
+		defer mdsConn.Close()
+	}
+	if resp == nil {
+		return
+	}
+//	buf.WriteString(fmt.Sprintf("mem allocate time: %v --->", time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println("mem allocate time: ", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds())
+
+	// fmt.Println("disk-id: ", resp.Ds)
+	ctx.dssStart = time.Now()
+	defer func() {
+		ctx.dssTime = time.Since(ctx.dssStart).Nanoseconds() / time.Millisecond.Nanoseconds()
+	}()
+	conns, streams := getConns(ctx, int(resp.Ds))//获取dss链接和对应stream，
+	defer releaseConns(conns)
+	if streams == nil {
+//		log.Println("GET CONNNN FALLLLLLLLLL\n")
+		ctx.result = &Result{InternalError, fmt.Sprintf("grcp connect stream create error")}
+		return
+	}
+//	buf.WriteString(fmt.Sprintf("dss grpc craete time: %v --->", time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println(resp.Extents)
+
+	bufData, err := ioutil.ReadAll(ctx.reader)//读所有请求数据
+        glog.Infof("get file object datasize: %d",len(bufData));
+	if err != nil {
+//		log.Println("READ COSBENCH  FALLLLLLLLLL\n")
+		glog.Errorf("read file error: %v", err)
+		ctx.result = &Result{InternalError, fmt.Sprintf("read file error: %v", err)}
+	}
+
+	// concurrence send write request
+	for i := 0; i < int(resp.Count); i++ {
+		//data := make([]byte, 4096)
+		// data := make([]byte, resp.Extents[i].Length)
+		// rand.Read(data[:])
+		// data := RandStringBytesMaskImpr(int(resp.Extents[i].Length))
+
+		// fmt.Println(string(buf))
+		copySize := resp.Extents[i].Length
+		if len(bufData) < int(copySize) {
+			copySize = uint64(len(bufData))
+		}
+		data := bufData[:copySize]//数据拷贝，如果申请到的长度大于数据长度，那么让copysize= 数据长度
+		// copy(data, buf[:copySize])
+//		log.Println("READ FILE Start\n")
+
+		if err != io.EOF && err != nil {
+//			log.Println("READ FILE ERRRRRRRR2  FALLLLLLLLLL\n")
+			glog.Errorf("read file error: %v", err)
+			ctx.result = &Result{InternalError, fmt.Sprintf("read file error: %v", err)}
+			break
+		}
+		ctx.size += int64(len(data))//保留数据长度，log用
+
+		// fmt.Println("put req byte num: ", len(data))
+		req := &bitstore.PutRequest{
+			Offset: resp.Extents[i].Offset,
+			Length: resp.Extents[i].Length,
+			Data:   data,
+		}//初始化request
+		//req := &bitstore.PutRequest{
+		//	Offset: 0,
+		//	Length: 4096,
+		//	Data:   data,
+		//}
+
+		for _, stream := range streams {
+			go func(stream bitstore.BitStore_PutClient) {
+				err := stream.Send(req)//挨个发送数据
+				if err != nil {
+//					log.Println("DSSSS RETURNNNNN EERRRRRERERERR\n")
+					glog.Errorf("send file error: %v", err)
+				}
+				ctx.dssChan <- err
+			}(stream)
+		}
+	}
+
+//	buf.WriteString(fmt.Sprintf("req async send time: %v --->", time.Since(ctx.start).Nanoseconds()))
+
+	// wait for requests send finish
+	for i := 0; i < int(resp.Count)*len(streams); i++ {
+		<-ctx.dssChan//不在乎send错误
+	}
+
+//	buf.WriteString(fmt.Sprintf("req  send time: %v --->", time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println("req send time: ", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds())
+
+	// fmt.Println("req send success...")
+
+	// close send request
+/*	for _, stream := range streams {
+		if err := stream.CloseSend(); err != nil {
+			log.Println("127 127 127 127 127 127 127 127 127 ERRRRRRRRRRR\n")
+			ctx.result = &Result{InternalError, fmt.Sprintf("close stream error: %v", err)}
+			return
+		}
+	}
+*/
+	dssRltChan := make(chan error)
+	// receive replicate reply
+	for _, stream := range streams {//循环的是dss服务节点的固定序号进程，端口相同。
+		go func(stream bitstore.BitStore_PutClient) {
+			resp, err := stream.CloseAndRecv()
+			if err != nil {
+//				log.Println("139 139 139 139 139 139 139 139 139 139 139 ERRRRRR\n")
+//				log.Println(err)
+//				log.Println("139 139 139 139 139 139 139 139 139 139 139 ERRRRRR\n")
+				dssRltChan <- err
+				return
+			}
+			if resp.Errcode < 0 {
+//				log.Println("14444444444444444444444444444444\n")
+				dssRltChan <- fmt.Errorf("dss resp error: %v", resp.Errcode)
+				return
+			}
+			dssRltChan <- nil
+		}(stream)
+	}
+
+	// wait for dss replicate finish
+	for i := 0; i < len(streams); i++ {//等所有结束并且检查返回错误
+		err := <-dssRltChan
+		if err != nil {
+			ctx.result = &Result{InternalError, err.Error()}
+		}
+	}
+    buf.WriteString(fmt.Sprintf("DSS返回点: ",time.Since(ctx.start).Nanoseconds()))
+
+	buf.WriteString(fmt.Sprintf("DSS返回点:1000000 "))
+//	buf.WriteString(fmt.Sprintf("dss replicate time: %v --->", time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println("dss replicate time: ", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds())
+
+	// fmt.Println("wait for mds replicate")
+	// wait for mds replicate reply. timeout 5s
+	select {//log
+	case <-time.After(5 * time.Second):
+		ctx.result = &Result{InternalError, fmt.Sprintf("mds replicate timeout: %ds", 5)}
+	case mdsRet := <-ctx.mdsChan:
+		if mdsRet != 0 {
+//			log.Println("172222222222222222222222222 errrrrrrrr\n")
+			ctx.result = &Result{InternalError, fmt.Sprintf("mds replicate error: %v", mdsRet)}
+		}
+	}
+
+	buf.WriteString(fmt.Sprintf("mds replicate time: %v --->", time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println("mds replicate time: ", time.Since(ctx.start).Nanoseconds()/time.Millisecond.Nanoseconds())
+	fmt.Println(buf.String())
+}
+
+func releaseConns(conns []pool.Conn) {
+	for _, conn := range conns {
+		conn.Close()
+	}
+}
+
+
+
+// func getConns(ctx *Context, diskid int) ([]pool.Conn, []bitstore.BitStore_PutClient) {
+func getConns(ctx *Context, mdsAddr string) ([]pool.Conn, []bitstore.BitStore_PutClient) {
+	// addrs := config.GetDiskServer(diskid)//这里得到每一个dss节点，第diskid个进程服务地址。
+	// fmt.Println(diskid)
+	// fmt.Println(addrs)
+	//addrs := []string{"10.90.27.13:8071"}
+
+	addrs := config.GetMinLoadDssServer(mdsAddr)
+
+	conns := make([]pool.Conn, 0, len(addrs))
+	streams := make([]bitstore.BitStore_PutClient, 0, len(addrs))
+
+	for _, addr := range addrs {
+		//conn, err := grpc.Dial(addr, DialOpt...)
+		conn, err := config.DSSPool[addr].Get()//获得每一个dss节点对应进程的链接
+		if err != nil {
+			ctx.result = &Result{InternalError, fmt.Sprintf("can't connect: %v", err)}
+			return conns, nil
+		}
+		client := bitstore.NewBitStoreClient(conn.Value())
+		stream, err := client.Put(context.Background())//得到流
+		if err != nil {
+			ctx.result = &Result{InternalError, fmt.Sprintf("put stream error: %v", err)}
+			return conns, nil
+		}
+
+		conns = append(conns, conn)
+		streams = append(streams, stream)
+	}
+
+	return conns, streams//返回
+}
+
+func allocMetadata(buf *bytes.Buffer, ctx *Context) (*mds.SpaceResponse, pool.Conn , string) {
+	ctx.mdsStart = time.Now()
+	defer func() {
+		ctx.mdsTime = time.Since(ctx.mdsStart).Nanoseconds() / time.Millisecond.Nanoseconds()
+	}()
+	mdsAddr := SelectMds(ctx.ns, ctx.key)//应该是随机获得一个mds地址
+	if mdsAddr == "" {
+		ctx.result = &Result{InternalError, fmt.Sprintf("no mds to use")}
+		return nil, nil
+	}
+	// conn, err := grpc.Dial(mdsAddr, DialOpt...)
+	conn, err := config.MDSPool[mdsAddr].Get()//根据刚才得到的地址得到一个mds链接
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("can't connect: %v", err)}
+		return nil, nil
+	}
+	fmt.Println("grpc dial time: ", time.Since(ctx.mdsStart).Nanoseconds())
+	client := mds.NewMetadataServerClient(conn.Value())//根据刚才的链接来得到一个mdsclient
+	req := mds.SpaceRequest{
+		Name: ctx.ns + ctx.key,
+		Size: uint64(config.AllocateUint),
+	}//初始化mds请求信息
+	fmt.Println("new mds client time: ", time.Since(ctx.mdsStart).Nanoseconds())
+
+	stream, err := client.GetSpace(context.Background(), &req)//详见mds.pb.go
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get space request error: %v", err)}
+		return nil, conn
+	}
+	sctx := stream.Context()//得到一个信息？？？啥用？
+	buf.WriteString(fmt.Sprintf("send space req time: %v --->", time.Since(ctx.start).Nanoseconds()))
+
+	// fmt.Println("get space req time: ", time.Since(ctx.mdsStart).Nanoseconds()/time.Millisecond.Nanoseconds())
+
+	// sctx := stream.Context()
+	// first relpy: allocate space from memory
+	resp, err := stream.Recv()
+        buf.WriteString(fmt.Sprintf("MDS返回点1:%v ",time.Since(ctx.start).Nanoseconds()))
+
+	if err != nil {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get space error: %v", err)}
+		return nil, conn
+	}
+
+	if resp.Ret < 0 {
+		ctx.result = &Result{InternalError, fmt.Sprintf("get space ret error: %d", resp.Ret)}
+		return nil, conn
+	}
+
+	if resp.Count == 0 {
+		ctx.result = &Result{InternalError, fmt.Sprintf("no space to allocate")}
+		return nil, conn
+	}
+//	buf.WriteString(fmt.Sprintf("space recv time: %v --->", time.Since(ctx.start).Nanoseconds()))
+ //       buf.WriteString(fmt.Sprintf("MDS返回点:%v ",time.Since(ctx.start).Nanoseconds()))
+	// fmt.Println("recv time: ", time.Since(ctx.mdsStart).Nanoseconds()/time.Millisecond.Nanoseconds())
+
+	// async recv secend reply: sync space to other replicate
+	go func() {//用来检查返回信息是否正确，会进第一个case，然后获取第二个返回值？不进第一个case？直接进default？？？，看getspaace怎么写的了。
+		for {
+			select {
+			case <-sctx.Done():
+				if sctx.Err() != nil {
+					ctx.mdsChan <- -1
+				} else {
+					ctx.mdsChan <- 0
+				}
+				return
+			default:
+				resp, err := stream.Recv()
+				buf.WriteString(fmt.Sprintf("MDS返回点2:%v ",time.Since(ctx.start).Nanoseconds()))
+				if err != nil {
+					ctx.mdsChan <- -1
+				} else if resp.Ret < 0 {
+					ctx.mdsChan <- -1
+				} else {
+					ctx.mdsChan <- 0
+				}
+				return
+			}
+		}
+	}()
+	return resp, conn,mdsAddr//只返回mds返回点1的resp，和对应随机mds的链接。
+}
+
+func GenerateKeyGrpc() string {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	candidates := []byte(Characters)
+	buf := bytes.NewBuffer(nil)
+	count := len(Characters)
+	for i := 0; i < KeySize; i++ {
+		index := r.Intn(count)
+		buf.WriteByte(candidates[index])
+	}
+	return fmt.Sprintf("%s%s", MagicNum, buf.String())
+}
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+const (
+	letterIdxBits = 6                    // 6 bits to represent a letter index
+	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
+	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
+)
+
+func RandStringBytesMaskImpr(n int) []byte {
+	b := make([]byte, n)
+	// A rand.Int63() generates 63 random bits, enough for letterIdxMax letters!
+	for i, cache, remain := n-1, rand.Int63(), letterIdxMax; i >= 0; {
+		if remain == 0 {
+			cache, remain = rand.Int63(), letterIdxMax
+		}
+		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
+			b[i] = letterBytes[idx]
+			i--
+		}
+		cache >>= letterIdxBits
+		remain--
+	}
+
+	return b
+}
